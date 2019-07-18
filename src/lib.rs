@@ -17,15 +17,11 @@
 //! Foo will be getting a callback from dynamic_reload before Bar is reloaded and that allows Foo to take needed action.
 //! Then another call will be made after Bar has been reloaded to allow Foo to restore state for Bar if needed.
 //!
-extern crate libc;
-extern crate notify;
-extern crate libloading;
-extern crate tempdir;
 
 use libloading::Library;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use notify::{RecommendedWatcher, Watcher};
 use tempdir::TempDir;
 use std::time::Duration;
@@ -39,6 +35,8 @@ mod error;
 pub use self::error::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+pub type DebouncedEvent = notify::Result<notify::Event>;
 
 /// Contains the information for a loaded library.
 pub struct Lib {
@@ -57,7 +55,7 @@ pub struct DynamicReload {
     watcher: Option<RecommendedWatcher>,
     shadow_dir: Option<TempDir>,
     search_paths: Vec<PathBuf>,
-    watch_recv: Receiver<notify::DebouncedEvent>,
+    watch_recv: Receiver<DebouncedEvent>,
 }
 
 /// Searching for a shared library can be done in current directory, but can also be allowed to
@@ -126,19 +124,20 @@ impl<'a> DynamicReload {
     /// DynamicReload::new(Some(vec!["../.."]), Some("target/debug"), Search::Backwards);
     /// ```
     ///
-    pub fn new(search_paths: Option<Vec<&'a str>>,
-               shadow_dir: Option<&'a str>,
-               _search: Search)
-        -> DynamicReload {
-            let (tx, rx) = channel();
-            DynamicReload {
-                libs: Vec::new(),
-                watcher: Self::get_watcher(tx),
-                shadow_dir: Self::get_temp_dir(shadow_dir),
-                watch_recv: rx,
-                search_paths: Self::get_search_paths(search_paths),
-            }
+    pub fn new(
+        search_paths: Option<Vec<&'a str>>,
+        shadow_dir: Option<&'a str>,
+        _search: Search
+    ) -> Self {
+        let (tx, rx) = unbounded();
+        Self {
+            libs: Vec::new(),
+            watcher: Self::get_watcher(tx),
+            shadow_dir: Self::get_temp_dir(shadow_dir),
+            watch_recv: rx,
+            search_paths: Self::get_search_paths(search_paths),
         }
+    }
 
     ///
     /// Add a library to be loaded and to be reloaded once updated.
@@ -167,31 +166,28 @@ impl<'a> DynamicReload {
     /// add_library("test_lib", PlatformName::Yes)
     /// ```
     ///
-    pub fn add_library(&mut self,
-                       name: &str,
-                       name_format: PlatformName)
-        -> Result<Arc<Lib>> {
-            match Self::try_load_library(self, name, name_format) {
-                Ok(lib) => {
-                    if let Some(w) = self.watcher.as_mut() {
-                        if let Some(path) = lib.original_path.as_ref() {
-                            let parent = path.as_path().parent().unwrap();
-                            let parent_buf = if cfg!(windows) {
-                                parent.to_path_buf().canonicalize().unwrap()
-                            } else {
-                                parent.to_path_buf()
-                            };
+    pub fn add_library(&mut self, name: &str, name_format: PlatformName) -> Result<Arc<Lib>> {
+        match Self::try_load_library(self, name, name_format) {
+            Ok(lib) => {
+                if let Some(w) = self.watcher.as_mut() {
+                    if let Some(path) = lib.original_path.as_ref() {
+                        let parent = path.as_path().parent().unwrap();
+                        let parent_buf = if cfg!(windows) {
+                            parent.to_path_buf().canonicalize().unwrap()
+                        } else {
+                            parent.to_path_buf()
+                        };
 
-                            let _ = w.watch(parent_buf, notify::RecursiveMode::NonRecursive);
-                        }
+                        let _ = w.watch(parent_buf, notify::RecursiveMode::NonRecursive);
                     }
-                    // Bump the ref here as we keep one around to keep track of files that needs to be reloaded
-                    self.libs.push(lib.clone());
-                    Ok(lib)
                 }
-                Err(e) => Err(e),
+                // Bump the ref here as we keep one around to keep track of files that needs to be reloaded
+                self.libs.push(lib.clone());
+                Ok(lib)
             }
+            Err(e) => Err(e),
         }
+    }
 
     ///
     /// Needs to be called in order to handle reloads of libraries.
@@ -222,69 +218,74 @@ impl<'a> DynamicReload {
     /// }
     /// ```
     ///
-    pub fn update<F, T>(&mut self, ref update_call: F, data: &mut T) where F: Fn(&mut T, UpdateState, Option<&Arc<Lib>>)
-    {
+    pub fn update<T>(
+        &mut self,
+        ref update_call: impl Fn(&mut T, UpdateState, Option<&Arc<Lib>>),
+        data: &mut T
+    ) {
         while let Ok(evt) = self.watch_recv.try_recv() {
-            use notify::DebouncedEvent::*;
-            match evt {
-                NoticeWrite(ref path) | Write(ref path) | Create(ref path) => {
-                    Self::reload_libs(self,
-                                      path,
-                                      update_call,
-                                      data);
-                },
-                _ => (),
+            evt
+                .map(|evt| {
+                    match evt.kind {
+                        notify::EventKind::Modify(_) => {
+                            evt.paths
+                                .last()
+                                .map(|path|
+                                     Self::reload_libs(self, path, update_call, data)
+                                )
+                                .unwrap_or_else(|| panic!("Plugin path not found!"))
+                        }
+                        _ => (),
+                    }
+                })
+                .unwrap_or_else(|err| panic!("Notify error: {:?}", err));
+        }
+    }
+
+    fn reload_libs<T>(
+        &mut self,
+        file_path: &PathBuf,
+        ref update_call: impl Fn(&mut T, UpdateState, Option<&Arc<Lib>>),
+        data: &mut T
+    ) {
+        let len = self.libs.len();
+        for i in (0..len).rev() {
+            if Self::should_reload(file_path, &self.libs[i]) {
+                Self::reload_lib(self, i, file_path, update_call, data);
             }
         }
     }
 
-    fn reload_libs<F, T>(&mut self,
-                         file_path: &PathBuf,
-                         ref update_call: F,
-                         data: &mut T)
-        where F: Fn(&mut T, UpdateState, Option<&Arc<Lib>>)
-        {
-            let len = self.libs.len();
-            for i in (0..len).rev() {
-                if Self::should_reload(file_path, &self.libs[i]) {
-                    Self::reload_lib(self, i, file_path, update_call, data);
-                }
+    fn reload_lib<T>(
+        &mut self,
+        index: usize,
+        file_path: &PathBuf,
+        ref update_call: impl Fn(&mut T, UpdateState, Option<&Arc<Lib>>),
+        data: &mut T
+    ) {
+        update_call(data, UpdateState::Before, Some(&self.libs[index]));
+        self.remove_lib(index);
+
+        match Self::load_library(self, file_path) {
+            Ok(lib) => {
+                self.libs.push(lib.clone());
+                update_call(data, UpdateState::After, Some(&lib));
+            }
+
+            Err(err) => {
+                update_call(data, UpdateState::ReloadFailed(err), None);
+                //println!("Unable to reload lib {:?} err {:?}", file_path, err); // Removed due to move in previous line
             }
         }
+    }
 
-    fn reload_lib<F, T>(&mut self,
-                        index: usize,
-                        file_path: &PathBuf,
-                        ref update_call: F,
-                        data: &mut T)
-        where F: Fn(&mut T, UpdateState, Option<&Arc<Lib>>)
-        {
-            update_call(data, UpdateState::Before, Some(&self.libs[index]));
-            self.remove_lib(index);
 
-            match Self::load_library(self, file_path) {
-                Ok(lib) => {
-                    self.libs.push(lib.clone());
-                    update_call(data, UpdateState::After, Some(&lib));
-                }
-
-                Err(err) => {
-                    update_call(data, UpdateState::ReloadFailed(err), None);
-                    //println!("Unable to reload lib {:?} err {:?}", file_path, err); // Removed due to move in previous line
-                }
-            }
+    fn try_load_library(&self, name: &str, name_format: PlatformName) -> Result<Arc<Lib>> {
+        match Self::search_dirs(self, name, name_format) {
+            Some(path) => Self::load_library(self, &path),
+            None => Err(Error::Find(name.into())),
         }
-
-
-    fn try_load_library(&self,
-                        name: &str,
-                        name_format: PlatformName)
-        -> Result<Arc<Lib>> {
-            match Self::search_dirs(self, name, name_format) {
-                Some(path) => Self::load_library(self, &path),
-                None => Err(Error::Find(name.into())),
-            }
-        }
+    }
 
 
     fn load_library(&self, full_path: &PathBuf) -> Result<Arc<Lib>> {
@@ -293,7 +294,7 @@ impl<'a> DynamicReload {
 
         if let Some(sd) = self.shadow_dir.as_ref() {
             path = Self::format_filename(sd.path(), full_path);
-            try!(Self::try_copy(&full_path, &path));
+            Self::try_copy(&full_path, &path)?;
             original_path = Some(full_path.clone());
         } else {
             original_path = None;
@@ -303,16 +304,16 @@ impl<'a> DynamicReload {
         Self::init_library(original_path, path)
     }
 
-    fn init_library(org_path: Option<PathBuf>, path: PathBuf) -> Result<Arc<Lib>> {
-        match Library::new(&path) {
-            Ok(l) => {
+    fn init_library(original_path: Option<PathBuf>, loaded_path: PathBuf) -> Result<Arc<Lib>> {
+        match Library::new(&loaded_path) {
+            Ok(lib) => {
                 Ok(Arc::new(Lib {
-                    original_path: org_path,
-                    loaded_path: path,
-                    lib: l,
+                    original_path,
+                    loaded_path,
+                    lib,
                 }))
             }
-            Err(e) => Err(Error::Load(e))
+            Err(err) => Err(Error::Load(err))
         }
     }
 
@@ -416,10 +417,10 @@ impl<'a> DynamicReload {
     // to read from it directly so this code does some testing first to ensure we
     // can actually read from it (by using metadata which does a stat on the file).
     // If we can't read from it, we wait for 100 ms before we try again, if we can't
-    // do it within 1 sec we give up
+    // do it within 5 sec we give up
     //
     fn try_copy(src: &Path, dest: &Path) -> Result<()> {
-        for _ in 0..10 {
+        for _ in 0..50 {
             if let Ok(file) = fs::metadata(src) {
                 let len = file.len();
                 if len > 0 {
@@ -437,8 +438,8 @@ impl<'a> DynamicReload {
         Err(Error::CopyTimeOut(src.to_path_buf(), dest.to_path_buf()))
     }
 
-    fn get_watcher(tx: Sender<notify::DebouncedEvent>) -> Option<RecommendedWatcher> {
-        match notify::watcher(tx, Duration::from_secs(2)) {
+    fn get_watcher(tx: Sender<DebouncedEvent>) -> Option<RecommendedWatcher> {
+        match notify::watcher(tx, Duration::from_secs(1)) {
             Ok(watcher) => Some(watcher),
             Err(e) => {
                 println!("Unable to create file watcher, no dynamic reloading will be done, \
@@ -507,9 +508,9 @@ impl<'a> DynamicReload {
               target_os="dragonfly",
               target_os="netbsd",
               target_os="openbsd"))]
-        fn get_dynamiclib_name(name: &str) -> String {
-            format!("lib{}.so", name)
-        }
+    fn get_dynamiclib_name(name: &str) -> String {
+        format!("lib{}.so", name)
+    }
 }
 
 impl PartialEq for Lib {
@@ -522,11 +523,18 @@ impl PartialEq for Lib {
     }
 }
 
+impl Drop for DynamicReload {
+    fn drop(&mut self) {
+        self.shadow_dir
+            .take()
+            .map(|dir| dir.close().ok());
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::channel;
+    use crossbeam_channel::unbounded;
     use std::path::{Path, PathBuf};
     use std::env;
     use std::thread;
@@ -571,7 +579,7 @@ mod tests {
 
     #[test]
     fn test_get_watcher() {
-        let (tx, _) = channel();
+        let (tx, _) = unbounded();
         // We expect this to always work
         assert!(DynamicReload::get_watcher(tx).is_some());
     }
